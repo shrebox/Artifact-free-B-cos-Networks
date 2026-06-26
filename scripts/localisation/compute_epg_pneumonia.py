@@ -1,0 +1,1149 @@
+#!/usr/bin/env python3
+"""
+EPG (Energy-based Pointing Game) Precision & Recall for Pneumonia dataset.
+
+Implements the EPG metrics defined in the paper (Appendix B, Eqs. 2-3):
+
+  EPG Precision = sum(Lp in bbox) / sum(Lp in entire image)         [Eq. 2]
+  EPG Recall    = sum(Lp in bbox) / (sum(Lp in bbox) + sum(|Ln| in bbox))  [Eq. 3]
+
+where Lp = max(L^c, 0) (positive contributions) and Ln = min(L^c, 0) (negative contributions).
+With threshold t: only values above t * max(Lp) are considered.
+
+Additional metrics:
+  Union Precision  = sum(Lp in union_of_all_bboxes) / sum(Lp in image)
+                     Single value per image over the merged mask of all GT boxes.
+  BBox IoU         = IoU(binarised_attribution_map, GT_bbox_mask)
+                     Attribution map is min-max normalised and binarised at --iou_threshold.
+                     This is threshold-independent (does not use the EPG threshold sweep).
+
+NOTE on EPG Recall for CAM methods:
+  CAM methods (GradCAM, LayerCAM, etc.) produce non-negative saliency maps, so Ln is
+  empty and recall is trivially 1.0. This is consistent with the paper (Table 5 only
+  reports recall for B-cos inherent explanations). We still compute it for completeness.
+
+Edge-case handling:
+  When total positive energy is negligible (< 1e-7), precision/recall/IoU are marked as
+  *undefined* (NaN) and excluded from the mean.  The count of defined values is reported
+  alongside each metric so the user can judge how many images contributed.
+
+Aggregation:
+  - Per bounding box per image: compute EPG precision & recall (per-box mean, NaN-aware)
+  - Union-mask precision: single value per image over merged GT mask
+  - BBox IoU: single value per image
+  - Mean across all images for the dataset-level metric (undefined values excluded)
+  - Additionally split by TP (model predicts pneumonia correctly) vs FN (incorrect)
+
+Usage:
+  # Single experiment, test locally:
+  python compute_epg_pneumonia.py --experiment_paths /path/to/exp1
+
+  # Multiple experiments:
+  python compute_epg_pneumonia.py --experiment_paths /path/to/exp1 /path/to/exp2
+
+  # Only specific methods:
+  python compute_epg_pneumonia.py --experiment_paths /path/to/exp1 --methods bcos gradcam
+
+  # With threshold sweep:
+  python compute_epg_pneumonia.py --experiment_paths /path/to/exp1 --thresholds 0.0 0.2 0.4 0.6 0.8
+
+  # Limit samples for quick testing:
+  python compute_epg_pneumonia.py --experiment_paths /path/to/exp1 --max_samples 50
+
+SLURM example:
+  sbatch --job-name=epg --cpus-per-task=4 --mem=16G --time=02:00:00 \\
+    --wrap="python compute_epg_pneumonia.py --experiment_paths /path/to/exp1 /path/to/exp2"
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+
+# ---------------------------------------------------------------------------
+# Project imports -- adjust sys.path based on where this script lives
+# ---------------------------------------------------------------------------
+# The script is at:  <repo>/scripts/explanation/compute_epg_pneumonia.py
+# Experiment utils:  <repo>/bcos/experiments/utils.py
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from bcos.experiments.utils import Experiment  # noqa: E402
+
+# CAM imports (optional -- gracefully degrade if not installed)
+try:
+    from pytorch_grad_cam import (
+        AblationCAM,
+        FinerCAM,
+        GradCAM,
+        GradCAMPlusPlus,
+        HiResCAM,
+        LayerCAM,
+    )
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+    HAS_GRAD_CAM = True
+except ImportError:
+    HAS_GRAD_CAM = False
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+ORIGINAL_SIZE = 1024  # RSNA DICOMs are 1024x1024
+
+# Map of supported CAM methods (name -> class)
+CAM_REGISTRY = {}
+if HAS_GRAD_CAM:
+    CAM_REGISTRY = {
+        "gradcam": GradCAM,
+        "layercam": LayerCAM,
+        "hirescam": HiResCAM,
+        "gradcampp": GradCAMPlusPlus,
+        "ablationcam": AblationCAM,
+        "finercam": FinerCAM,
+    }
+
+ALL_METHODS = ["bcos"] + list(CAM_REGISTRY.keys()) + ["gradxinput"]
+
+
+# ============================================================================
+# EPG core functions (faithful to paper Eqs. 2 & 3)
+# ============================================================================
+_UNDEFINED = float("nan")  # sentinel for degenerate / undefined metric values
+
+
+def epg_precision_single_box(
+    contribution_map: torch.Tensor,
+    bbox_xyxy: Tuple[int, int, int, int],
+    threshold: float = 0.0,
+) -> float:
+    """
+    EPG Precision for a single bounding box (Eq. 2 in paper).
+
+    precision = sum(Lp in bbox) / sum(Lp in entire image)
+
+    where Lp = positive contributions only, with threshold applied.
+    Returns NaN when total positive energy is ~0 (undefined).
+    """
+    cm = contribution_map.clone()
+
+    # Zero out negative values -> Lp
+    cm[cm < 0] = 0
+
+    # Apply threshold: keep only values >= t * max(Lp)
+    if threshold > 0.0:
+        max_val = cm.max()
+        if max_val > 0:
+            cm[cm < threshold * max_val] = 0
+
+    total_energy = cm.sum().item()
+    if total_energy < 1e-7:
+        return _UNDEFINED
+
+    x1, y1, x2, y2 = bbox_xyxy
+    bbox_energy = cm[y1:y2, x1:x2].sum().item()
+
+    return bbox_energy / total_energy
+
+
+def epg_recall_single_box(
+    contribution_map: torch.Tensor,
+    bbox_xyxy: Tuple[int, int, int, int],
+    threshold: float = 0.0,
+) -> float:
+    """
+    EPG Recall for a single bounding box (Eq. 3 in paper).
+
+    recall = sum(Lp in bbox) / (sum(Lp in bbox) + sum(|Ln| in bbox))
+
+    where Lp = positive values, Ln = negative values, both within the bbox.
+    Threshold is applied to Lp globally before extracting the bbox region.
+    Returns NaN when denominator is ~0 (undefined).
+    """
+    cm = contribution_map.clone()
+
+    x1, y1, x2, y2 = bbox_xyxy
+    bbox_region = cm[y1:y2, x1:x2]
+
+    # Separate positive and negative
+    positive_in_bbox = bbox_region.clone()
+    positive_in_bbox[positive_in_bbox < 0] = 0
+
+    negative_in_bbox = bbox_region.clone()
+    negative_in_bbox[negative_in_bbox > 0] = 0
+
+    # Apply threshold to positive values: keep only >= t * max(Lp) of global map
+    if threshold > 0.0:
+        cm_pos = cm.clone()
+        cm_pos[cm_pos < 0] = 0
+        global_max = cm_pos.max()
+        if global_max > 0:
+            thresh_val = threshold * global_max
+            positive_in_bbox[positive_in_bbox < thresh_val] = 0
+
+    sum_pos = positive_in_bbox.sum().item()
+    sum_abs_neg = negative_in_bbox.abs().sum().item()
+
+    denom = sum_pos + sum_abs_neg
+    if denom < 1e-7:
+        return _UNDEFINED
+
+    return sum_pos / denom
+
+
+# ---------------------------------------------------------------------------
+# Union-mask EPG precision (Sukrut-style: single value over union of all boxes)
+# ---------------------------------------------------------------------------
+def epg_precision_union(
+    contribution_map: torch.Tensor,
+    bboxes: List[Tuple[int, int, int, int]],
+    threshold: float = 0.0,
+) -> float:
+    """
+    EPG Precision computed over the *union* of all bounding boxes.
+
+    precision = sum(Lp in union_mask) / sum(Lp in entire image)
+
+    Unlike the per-box variant, this creates a single binary mask from all
+    boxes and computes one ratio.  Larger boxes naturally contribute more.
+    Returns NaN when total positive energy is ~0 (undefined).
+    """
+    cm = contribution_map.clone()
+    cm[cm < 0] = 0
+
+    if threshold > 0.0:
+        max_val = cm.max()
+        if max_val > 0:
+            cm[cm < threshold * max_val] = 0
+
+    total_energy = cm.sum().item()
+    if total_energy < 1e-7:
+        return _UNDEFINED
+
+    union_mask = torch.zeros_like(cm, dtype=torch.bool)
+    for x1, y1, x2, y2 in bboxes:
+        union_mask[y1:y2, x1:x2] = True
+
+    union_energy = cm[union_mask].sum().item()
+    return union_energy / total_energy
+
+
+def epg_recall_union(
+    contribution_map: torch.Tensor,
+    bboxes: List[Tuple[int, int, int, int]],
+    threshold: float = 0.0,
+) -> float:
+    """
+    EPG Recall computed over the *union* of all bounding boxes.
+
+    recall = sum(Lp in union_mask) / (sum(Lp in union_mask) + sum(|Ln| in union_mask))
+
+    Threshold is applied to the positive values globally before extracting
+    the union region.  Returns NaN when denominator is ~0 (undefined).
+    """
+    cm = contribution_map.clone()
+
+    # Build union mask
+    union_mask = torch.zeros(cm.shape, dtype=torch.bool, device=cm.device)
+    for x1, y1, x2, y2 in bboxes:
+        union_mask[y1:y2, x1:x2] = True
+
+    union_region = cm[union_mask]
+
+    # Separate positive / negative within the union
+    positive = union_region.clone()
+    positive[positive < 0] = 0
+
+    negative = union_region.clone()
+    negative[negative > 0] = 0
+
+    # Apply threshold to positive values (global max)
+    if threshold > 0.0:
+        cm_pos = cm.clone()
+        cm_pos[cm_pos < 0] = 0
+        global_max = cm_pos.max()
+        if global_max > 0:
+            positive[positive < threshold * global_max] = 0
+
+    sum_pos = positive.sum().item()
+    sum_abs_neg = negative.abs().sum().item()
+
+    denom = sum_pos + sum_abs_neg
+    if denom < 1e-7:
+        return _UNDEFINED
+
+    return sum_pos / denom
+
+
+# ---------------------------------------------------------------------------
+# Bounding-box IoU metric (spatial overlap, Sukrut-style)
+# ---------------------------------------------------------------------------
+def bbox_iou(
+    contribution_map: torch.Tensor,
+    bboxes: List[Tuple[int, int, int, int]],
+    iou_threshold: float = 0.5,
+) -> float:
+    """
+    Bounding-box IoU between the binarised attribution map and the GT boxes.
+
+    Steps:
+      1. Clamp to positive values.
+      2. Min-max normalise to [0, 1].
+      3. Binarise at ``iou_threshold``.
+      4. Compute IoU with the union bbox mask.
+
+    Returns NaN when the union area is 0 (undefined).
+    """
+    cm = contribution_map.clone()
+    cm[cm < 0] = 0  # positive only
+
+    # Min-max normalise
+    cm_min = cm.min()
+    cm_max = cm.max()
+    if (cm_max - cm_min).abs() < 1e-7:
+        if cm_max.item() == 0:
+            return _UNDEFINED
+        cm = cm / cm_max
+    else:
+        cm = (cm - cm_min) / (cm_max - cm_min)
+
+    # Binarise
+    attr_bin = cm > iou_threshold  # bool tensor
+
+    # Union bbox mask
+    bb_mask = torch.zeros_like(cm, dtype=torch.bool)
+    for x1, y1, x2, y2 in bboxes:
+        bb_mask[y1:y2, x1:x2] = True
+
+    intersection = (attr_bin & bb_mask).sum().item()
+    union = (attr_bin | bb_mask).sum().item()
+
+    if union == 0:
+        return _UNDEFINED
+
+    return intersection / union
+
+
+# ============================================================================
+# Bounding box helpers
+# ============================================================================
+def clamp_bbox(
+    x1: int, y1: int, x2: int, y2: int, H: int, W: int
+) -> Optional[Tuple[int, int, int, int]]:
+    """Clamp bbox to image bounds and ensure valid (non-empty)."""
+    x1 = max(0, min(int(x1), W))
+    x2 = max(0, min(int(x2), W))
+    y1 = max(0, min(int(y1), H))
+    y2 = max(0, min(int(y2), H))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def get_bboxes_for_patient(
+    df_boxes: pd.DataFrame,
+    patient_id: str,
+    target_h: int,
+    target_w: int,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Get all pneumonia bounding boxes for a patient, scaled to target resolution.
+    Returns list of (x1, y1, x2, y2) tuples.
+    """
+    rows = df_boxes[(df_boxes["patientId"] == patient_id) & (df_boxes["Target"] == 1)]
+    if rows.empty:
+        return []
+
+    scale_x = target_w / ORIGINAL_SIZE
+    scale_y = target_h / ORIGINAL_SIZE
+
+    boxes = []
+    for _, r in rows.iterrows():
+        if pd.isna(r["x"]):
+            continue
+        x = int(round(float(r["x"]) * scale_x))
+        y = int(round(float(r["y"]) * scale_y))
+        w = int(round(float(r["width"]) * scale_x))
+        h = int(round(float(r["height"]) * scale_y))
+        bbox = clamp_bbox(x, y, x + w, y + h, target_h, target_w)
+        if bbox is not None:
+            boxes.append(bbox)
+    return boxes
+
+
+# ============================================================================
+# Model helpers
+# ============================================================================
+def is_bcos_model(model: torch.nn.Module) -> bool:
+    return hasattr(model, "explanation_mode")
+
+
+def get_cam_target_layer(model: torch.nn.Module) -> torch.nn.Module:
+    """Auto-detect the CAM target layer for ResNet / ConvNeXt / DenseNet.
+
+    DenseNet's ``model.features`` ends with a norm layer (``norm5``), so
+    ``features[-1]`` is a ``BatchNorm2d`` which is NOT subscriptable.
+    The correct target is ``features.denseblock4`` (= ``features[-2]``).
+
+    ConvNeXt's ``model.features[-1]`` is a ``Sequential`` of ``CNBlock``
+    modules, so ``features[-1][-1]`` works.
+    """
+    # ResNet family: model.layer4[-1]
+    if hasattr(model, "layer4"):
+        return model.layer4[-1]
+    elif hasattr(model, "features"):
+        # DenseNet: features has named children; look for the last denseblock
+        named = dict(model.features.named_children())
+        if "denseblock4" in named:
+            return named["denseblock4"]
+        # ConvNeXt: features[-1] is a Sequential of CNBlocks
+        last = model.features[-1]
+        if hasattr(last, "__getitem__"):
+            return last[-1]
+        # features[-1] is a single module (unknown arch) — use it directly
+        return last
+    else:
+        # Fallback: last Conv2d
+        last = None
+        for m in model.modules():
+            if isinstance(m, torch.nn.Conv2d):
+                last = m
+        if last is None:
+            raise RuntimeError("Cannot find a Conv2d target layer for CAM.")
+        return last
+
+
+def get_contribution_map(
+    model: torch.nn.Module,
+    method: str,
+    img: torch.Tensor,  # [C, H, W] on device
+    cam_obj=None,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """
+    Compute a 2D contribution/saliency map for the predicted class.
+
+    Returns [H, W] tensor (may contain negative values for B-cos methods).
+    Does NOT zero out negatives -- callers handle that per the EPG formula.
+    """
+    x = img.unsqueeze(0).requires_grad_(True)  # [1, C, H, W]
+
+    if method == "bcos":
+        # Use model.explanation_mode() context for proper B-cos gradient routing
+        with model.explanation_mode():
+            logits = model(x)
+            pred = int(logits.argmax(dim=1).item())
+
+            grad = torch.autograd.grad(
+                logits[0, pred], x, retain_graph=False, create_graph=False
+            )[0]
+            # Contribution map = (input * gradient).sum(channel_dim)
+            cm = (img * grad.squeeze(0)).sum(dim=0).detach()
+        return cm, pred, logits
+
+    elif method == "gradxinput":
+        logits = model(x)
+        pred = int(logits.argmax(dim=1).item())
+        model.zero_grad(set_to_none=True)
+        logits[0, pred].backward(inputs=[x])
+        grad = x.grad.detach().squeeze(0)
+        cm = (img.detach() * grad).sum(dim=0)
+        return cm, pred, logits
+
+    elif method in CAM_REGISTRY:
+        if cam_obj is None:
+            raise RuntimeError(f"CAM object not initialized for method '{method}'")
+        with torch.no_grad():
+            logits = model(x)
+        pred = int(logits.argmax(dim=1).item())
+        if method == "finercam":
+            # FinerCAM requires targets=None to activate its own
+            # FinerWeightedTarget (contrastive loss).  Passing explicit
+            # ClassifierOutputTarget makes it fall back to vanilla GradCAM.
+            # comparison_categories=[1] because Pneumonia is binary (2 classes);
+            # the default [1,2,3] causes IndexError for <4 classes.
+            cam_np = cam_obj(input_tensor=x, targets=None, comparison_categories=[1])
+        else:
+            targets = [ClassifierOutputTarget(pred)]
+            cam_np = cam_obj(input_tensor=x, targets=targets)  # [B, H_cam, W_cam]
+        cm = torch.from_numpy(cam_np[0]).to(device).float()
+        # CAM maps are non-negative by definition; resize to input res if needed
+        if cm.shape != img.shape[1:]:
+            cm = (
+                torch.nn.functional.interpolate(
+                    cm.unsqueeze(0).unsqueeze(0),
+                    size=img.shape[1:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                .squeeze(0)
+                .squeeze(0)
+            )
+        return cm, pred, logits
+
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+
+# ============================================================================
+# Per-image EPG computation
+# ============================================================================
+def _nanmean(xs: List[float]) -> float:
+    """Mean that ignores NaN (undefined) values.  Returns NaN if all undefined."""
+    defined = [v for v in xs if not np.isnan(v)]
+    return float(np.mean(defined)) if defined else _UNDEFINED
+
+
+def compute_epg_for_image(
+    contribution_map: torch.Tensor,  # [H, W], raw (with negatives for B-cos)
+    bboxes: List[Tuple[int, int, int, int]],
+    threshold: float = 0.0,
+    iou_threshold: float = 0.5,
+) -> Dict:
+    """
+    Compute all localisation metrics for one image.
+
+    Returns a dict with keys:
+      - perbox_precision:  mean of per-box EPG precision (NaN-aware)
+      - perbox_recall:     mean of per-box EPG recall    (NaN-aware)
+      - union_precision:   EPG precision over union mask  (single value)
+      - union_recall:      EPG recall over union mask     (single value)
+      - bbox_iou:          IoU between binarised attribution and GT mask
+    """
+    nan = _UNDEFINED
+    empty = {
+        "perbox_precision": nan,
+        "perbox_recall": nan,
+        "union_precision": nan,
+        "union_recall": nan,
+        "bbox_iou": nan,
+    }
+    if len(bboxes) == 0:
+        return empty
+
+    # Per-box metrics
+    precisions = []
+    recalls = []
+    for bbox in bboxes:
+        precisions.append(
+            epg_precision_single_box(contribution_map, bbox, threshold=threshold)
+        )
+        recalls.append(
+            epg_recall_single_box(contribution_map, bbox, threshold=threshold)
+        )
+
+    perbox_prec = _nanmean(precisions)
+    perbox_rec = _nanmean(recalls)
+
+    # Union-mask precision & recall
+    union_prec = epg_precision_union(contribution_map, bboxes, threshold=threshold)
+    union_rec = epg_recall_union(contribution_map, bboxes, threshold=threshold)
+
+    # Bbox IoU (no threshold dependency — uses its own binarisation)
+    iou_val = bbox_iou(contribution_map, bboxes, iou_threshold=iou_threshold)
+
+    return {
+        "perbox_precision": perbox_prec,
+        "perbox_recall": perbox_rec,
+        "union_precision": union_prec,
+        "union_recall": union_rec,
+        "bbox_iou": iou_val,
+    }
+
+
+# ============================================================================
+# Main evaluation loop for one experiment + one method
+# ============================================================================
+def evaluate_experiment_method(
+    exp_path: str,
+    method: str,
+    df_boxes: pd.DataFrame,
+    thresholds: List[float],
+    max_samples: Optional[int] = None,
+    device: torch.device = torch.device("cpu"),
+    reload: str = "last",
+    iou_threshold: float = 0.5,
+) -> Dict:
+    """
+    Run EPG evaluation for a single experiment + method combination.
+
+    Returns a dict with:
+      - per-threshold: {epg_precision_mean, union_precision_mean, epg_recall_mean, ...}
+      - threshold-independent: {bbox_iou_mean, ...}
+      - metadata: {n_images, n_tp, n_fn, method, experiment, ...}
+    """
+    t0 = time.time()
+    print(f"\n{'=' * 70}")
+    print(f"Experiment: {os.path.basename(exp_path)}")
+    print(f"Method:     {method}")
+    print(f"Checkpoint: {reload}")
+    print(f"Thresholds: {thresholds}")
+    print(f"{'=' * 70}")
+
+    # Load model (with checkpoint dict so we can extract the epoch number)
+    exp = Experiment(exp_path)
+    loaded = exp.load_trained_model(
+        reload=reload, return_training_ckpt_if_possible=True
+    )
+    if isinstance(loaded, dict):
+        model = loaded["model"].to(device)
+        training_ckpt = loaded.get("ckpt")
+        loaded_epoch = (
+            training_ckpt["epoch"]
+            if training_ckpt and "epoch" in training_ckpt
+            else None
+        )
+    else:
+        model = loaded.to(device)
+        loaded_epoch = None
+    del loaded
+    model.eval()
+    print(f"Loaded epoch: {loaded_epoch}")
+
+    # Check method compatibility
+    bcos = is_bcos_model(model)
+    if method == "bcos" and not bcos:
+        print(
+            f"  SKIP: method 'bcos' requested but model is not B-cos ({type(model).__name__})"
+        )
+        return {"skipped": True, "reason": "model is not B-cos"}
+    if method in CAM_REGISTRY and not HAS_GRAD_CAM:
+        print(f"  SKIP: pytorch-grad-cam not installed, cannot use '{method}'")
+        return {"skipped": True, "reason": "pytorch-grad-cam not installed"}
+
+    # Setup dataloader (with patient IDs)
+    dm = exp.get_datamodule()
+    dm.config["return_id"] = True
+    dm.setup("val")
+    loader = dm.val_dataloader()
+
+    # When running on CPU (e.g. CUDA init failed on the node), the default
+    # DataLoader with pin_memory=True and num_workers>0 will crash because
+    # PyTorch's _MultiProcessingDataLoaderIter calls torch.cuda.current_device()
+    # internally.  Recreate with CPU-safe settings.
+    if device.type == "cpu" and (
+        getattr(loader, "pin_memory", False) or getattr(loader, "num_workers", 0) > 0
+    ):
+        print(
+            "  WARNING: Rebuilding DataLoader with pin_memory=False, "
+            "num_workers=0 for CPU fallback (will be slower)"
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset=loader.dataset,
+            batch_size=loader.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=getattr(loader, "drop_last", False),
+        )
+
+    # Init CAM object if needed
+    cam_obj = None
+    if method in CAM_REGISTRY:
+        target_layer = get_cam_target_layer(model)
+        cam_cls = CAM_REGISTRY[method]
+        cam_obj = cam_cls(model=model, target_layers=[target_layer])
+        print(f"  CAM target layer: {type(target_layer).__name__}")
+
+    # Storage: per threshold -> lists of per-image scores
+    # Each list stores *defined* values only (NaN / undefined are excluded).
+    _METRIC_KEYS = [
+        "all_precision",
+        "all_recall",
+        "all_union_precision",
+        "all_union_recall",
+        "tp_precision",
+        "tp_recall",
+        "tp_union_precision",
+        "tp_union_recall",
+        "fn_precision",
+        "fn_recall",
+        "fn_union_precision",
+        "fn_union_recall",
+    ]
+    results_by_threshold = {}
+    for t in thresholds:
+        results_by_threshold[t] = {k: [] for k in _METRIC_KEYS}
+
+    # IoU is threshold-independent (uses its own binarisation), store once
+    iou_results = {"all": [], "tp": [], "fn": []}
+
+    n_images = 0
+    n_tp = 0
+    n_fn = 0
+    n_skipped_no_box = 0
+
+    # Main loop
+    for batch_idx, batch in enumerate(loader):
+        if not (isinstance(batch, (list, tuple)) and len(batch) >= 3):
+            raise RuntimeError(
+                "Expected batch of (images, labels, patient_ids). "
+                "Ensure dm.config['return_id'] = True."
+            )
+
+        images, labels, patient_ids = batch[0], batch[1], batch[2]
+        images = images.to(device)
+
+        for i in range(len(images)):
+            if max_samples is not None and n_images >= max_samples:
+                break
+
+            img = images[i]
+            gt = int(labels[i].item())
+            pid = str(patient_ids[i])
+
+            # Only evaluate images that have bounding boxes (Target==1)
+            bboxes_rows = df_boxes[
+                (df_boxes["patientId"] == pid) & (df_boxes["Target"] == 1)
+            ]
+            if bboxes_rows.empty:
+                n_skipped_no_box += 1
+                continue
+
+            # Get contribution map for this image
+            # NOTE: get_contribution_map handles explanation_mode() context internally
+            try:
+                cm, pred, logits = get_contribution_map(
+                    model, method, img, cam_obj=cam_obj, device=device
+                )
+            except Exception as e:
+                print(f"  WARNING: failed on {pid}: {type(e).__name__}: {e}")
+                continue
+
+            # Scale bboxes to contribution map resolution
+            cm_h, cm_w = cm.shape
+            bboxes = get_bboxes_for_patient(df_boxes, pid, cm_h, cm_w)
+            if len(bboxes) == 0:
+                n_skipped_no_box += 1
+                continue
+
+            is_correct = pred == gt
+            if is_correct:
+                n_tp += 1
+            else:
+                n_fn += 1
+            n_images += 1
+
+            # Compute metrics at each threshold
+            for ti, t in enumerate(thresholds):
+                m = compute_epg_for_image(
+                    cm, bboxes, threshold=t, iou_threshold=iou_threshold
+                )
+
+                # Append only defined (non-NaN) values
+                prefix = "tp_" if is_correct else "fn_"
+                for key, val in [
+                    ("precision", m["perbox_precision"]),
+                    ("recall", m["perbox_recall"]),
+                    ("union_precision", m["union_precision"]),
+                    ("union_recall", m["union_recall"]),
+                ]:
+                    if not np.isnan(val):
+                        results_by_threshold[t]["all_" + key].append(val)
+                        results_by_threshold[t][prefix + key].append(val)
+
+                # IoU is threshold-independent; collect on first threshold only
+                if ti == 0:
+                    iou_val = m["bbox_iou"]
+                    if not np.isnan(iou_val):
+                        iou_results["all"].append(iou_val)
+                        iou_results["tp" if is_correct else "fn"].append(iou_val)
+
+        if max_samples is not None and n_images >= max_samples:
+            break
+
+        # Progress
+        if (batch_idx + 1) % 20 == 0:
+            print(
+                f"  Processed {batch_idx + 1} batches, {n_images} images with boxes..."
+            )
+
+    # Clean up CAM
+    if cam_obj is not None:
+        del cam_obj
+
+    elapsed = time.time() - t0
+    print(
+        f"\n  Done: {n_images} images ({n_tp} TP, {n_fn} FN), "
+        f"{n_skipped_no_box} skipped (no boxes), {elapsed:.1f}s"
+    )
+
+    # Aggregate results  (only defined values are in the lists)
+    def safe_mean(xs):
+        return float(np.mean(xs)) if len(xs) > 0 else float("nan")
+
+    def safe_std(xs):
+        return float(np.std(xs)) if len(xs) > 0 else float("nan")
+
+    def safe_count(xs):
+        return len(xs)
+
+    output = {
+        "experiment_path": exp_path,
+        "experiment_tag": os.path.basename(exp_path.rstrip("/")),
+        "method": method,
+        "model_type": "bcos" if bcos else "baseline",
+        "reload": reload,
+        "loaded_epoch": loaded_epoch,
+        "n_images": n_images,
+        "n_tp": n_tp,
+        "n_fn": n_fn,
+        "n_skipped_no_box": n_skipped_no_box,
+        "elapsed_seconds": round(elapsed, 2),
+        # IoU is threshold-independent
+        "bbox_iou_mean": safe_mean(iou_results["all"]),
+        "bbox_iou_std": safe_std(iou_results["all"]),
+        "bbox_iou_n_defined": safe_count(iou_results["all"]),
+        "bbox_iou_tp_mean": safe_mean(iou_results["tp"]),
+        "bbox_iou_tp_std": safe_std(iou_results["tp"]),
+        "bbox_iou_fn_mean": safe_mean(iou_results["fn"]),
+        "bbox_iou_fn_std": safe_std(iou_results["fn"]),
+        "thresholds": {},
+    }
+
+    for t in thresholds:
+        r = results_by_threshold[t]
+        tk = f"{t:.2f}"
+        output["thresholds"][tk] = {
+            # Per-box precision (paper Eq. 2, averaged across boxes per image)
+            "epg_precision_mean": safe_mean(r["all_precision"]),
+            "epg_precision_std": safe_std(r["all_precision"]),
+            "epg_precision_n_defined": safe_count(r["all_precision"]),
+            # Per-box recall (paper Eq. 3, averaged across boxes per image)
+            "epg_recall_mean": safe_mean(r["all_recall"]),
+            "epg_recall_std": safe_std(r["all_recall"]),
+            "epg_recall_n_defined": safe_count(r["all_recall"]),
+            # Union-mask precision
+            "union_precision_mean": safe_mean(r["all_union_precision"]),
+            "union_precision_std": safe_std(r["all_union_precision"]),
+            "union_precision_n_defined": safe_count(r["all_union_precision"]),
+            # Union-mask recall
+            "union_recall_mean": safe_mean(r["all_union_recall"]),
+            "union_recall_std": safe_std(r["all_union_recall"]),
+            "union_recall_n_defined": safe_count(r["all_union_recall"]),
+            # TP splits
+            "epg_precision_tp_mean": safe_mean(r["tp_precision"]),
+            "epg_precision_tp_std": safe_std(r["tp_precision"]),
+            "epg_recall_tp_mean": safe_mean(r["tp_recall"]),
+            "epg_recall_tp_std": safe_std(r["tp_recall"]),
+            "union_precision_tp_mean": safe_mean(r["tp_union_precision"]),
+            "union_precision_tp_std": safe_std(r["tp_union_precision"]),
+            "union_recall_tp_mean": safe_mean(r["tp_union_recall"]),
+            "union_recall_tp_std": safe_std(r["tp_union_recall"]),
+            # FN splits
+            "epg_precision_fn_mean": safe_mean(r["fn_precision"]),
+            "epg_precision_fn_std": safe_std(r["fn_precision"]),
+            "epg_recall_fn_mean": safe_mean(r["fn_recall"]),
+            "epg_recall_fn_std": safe_std(r["fn_recall"]),
+            "union_precision_fn_mean": safe_mean(r["fn_union_precision"]),
+            "union_precision_fn_std": safe_std(r["fn_union_precision"]),
+            "union_recall_fn_mean": safe_mean(r["fn_union_recall"]),
+            "union_recall_fn_std": safe_std(r["fn_union_recall"]),
+        }
+
+    # Print summary table
+    print(
+        f"\n  {'Thresh':>6} | {'Prec':>8} | {'Rec':>8} | "
+        f"{'U-Prec':>8} | {'U-Rec':>8} | "
+        f"{'Prec TP':>8} | {'Prec FN':>8} | "
+        f"{'U-Prec TP':>9} | {'U-Rec TP':>9}"
+    )
+    sep = f"  {'-' * 6}-+-{('-' * 8 + '-+-') * 4}{('-' * 9 + '-+-') * 1}{'-' * 9}"
+    print(sep)
+    for t in thresholds:
+        tk = f"{t:.2f}"
+        d = output["thresholds"][tk]
+        print(
+            f"  {t:>6.2f} | {d['epg_precision_mean']:>8.4f} | {d['epg_recall_mean']:>8.4f} | "
+            f"{d['union_precision_mean']:>8.4f} | {d['union_recall_mean']:>8.4f} | "
+            f"{d['epg_precision_tp_mean']:>8.4f} | {d['epg_precision_fn_mean']:>8.4f} | "
+            f"{d['union_precision_tp_mean']:>9.4f} | {d['union_recall_tp_mean']:>9.4f}"
+        )
+    # IoU line (threshold-independent)
+    print(
+        f"\n  BBox IoU (all): {output['bbox_iou_mean']:.4f} +/- {output['bbox_iou_std']:.4f}  "
+        f"(TP: {output['bbox_iou_tp_mean']:.4f}, FN: {output['bbox_iou_fn_mean']:.4f}, "
+        f"n_defined: {output['bbox_iou_n_defined']}/{n_images})"
+    )
+
+    return output
+
+
+# ============================================================================
+# CSV summary writer
+# ============================================================================
+def write_summary_csv(all_results: List[Dict], out_path: str):
+    """Write a flat CSV summarizing all experiments x methods x thresholds."""
+    rows = []
+    for res in all_results:
+        if res.get("skipped"):
+            continue
+
+        # IoU fields are threshold-independent — repeat on every row
+        iou_fields = {
+            "bbox_iou_mean": res.get("bbox_iou_mean", ""),
+            "bbox_iou_std": res.get("bbox_iou_std", ""),
+            "bbox_iou_n_defined": res.get("bbox_iou_n_defined", ""),
+            "bbox_iou_tp_mean": res.get("bbox_iou_tp_mean", ""),
+            "bbox_iou_tp_std": res.get("bbox_iou_tp_std", ""),
+            "bbox_iou_fn_mean": res.get("bbox_iou_fn_mean", ""),
+            "bbox_iou_fn_std": res.get("bbox_iou_fn_std", ""),
+        }
+
+        for tk, metrics in res["thresholds"].items():
+            row = {
+                "experiment": res["experiment_tag"],
+                "method": res["method"],
+                "model_type": res["model_type"],
+                "reload": res.get("reload", ""),
+                "loaded_epoch": res.get("loaded_epoch", ""),
+                "threshold": float(tk),
+                "n_images": res["n_images"],
+                "n_tp": res["n_tp"],
+                "n_fn": res["n_fn"],
+            }
+            row.update(metrics)
+            row.update(iou_fields)
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(out_path, index=False, float_format="%.6f")
+    print(f"\nSummary CSV saved: {out_path}")
+
+
+# ============================================================================
+# Argument parser
+# ============================================================================
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compute EPG Precision & Recall for Pneumonia explanation methods.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--experiment_paths",
+        nargs="+",
+        required=True,
+        help="Path(s) to experiment directories (each containing config + checkpoints).",
+    )
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        default=None,
+        help=f"Explanation methods to evaluate. Options: {ALL_METHODS}. "
+        f"Default: auto-detect based on model type.",
+    )
+    parser.add_argument(
+        "--thresholds",
+        nargs="+",
+        type=float,
+        default=[0.0],
+        help="Threshold values (fraction of max saliency). Default: [0.0]",
+    )
+    parser.add_argument(
+        "--bbox_csv",
+        type=str,
+        default=None,
+        help="Path to RSNA stage_2_train_labels.csv. "
+        "Default: auto-detect from datasets/ or standard paths.",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Max images to evaluate (for quick testing). Default: all.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Directory to save results. Default: <first_experiment>/epg_results/",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device: 'cuda', 'cpu', or 'auto' (default).",
+    )
+    parser.add_argument(
+        "--reload",
+        type=str,
+        default="last",
+        help="Which checkpoint to load. Applied globally to all experiments. "
+        "Options: 'last', 'best', or a specific checkpoint name like "
+        "'epoch=19-val_acc1=0.8237' (without .ckpt extension). Default: 'last'.",
+    )
+    parser.add_argument(
+        "--iou_threshold",
+        type=float,
+        default=0.5,
+        help="Binarisation threshold for the BBox IoU metric. Default: 0.5.",
+    )
+    return parser.parse_args()
+
+
+def resolve_bbox_csv(args_csv: Optional[str]) -> str:
+    """Find the bbox CSV, trying user arg, then known paths."""
+    candidates = [
+        args_csv,
+        os.path.join(
+            REPO_ROOT,
+            "datasets",
+            "rsna-pneumonia-detection-challenge",
+            "stage_2_train_labels.csv",
+        ),
+        os.getenv("PNEUMONIA_CSV_PATH"),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    raise FileNotFoundError(
+        "Could not find stage_2_train_labels.csv. "
+        "Provide it via --bbox_csv or place it in datasets/rsna-pneumonia-detection-challenge/."
+    )
+
+
+def resolve_methods(
+    args_methods: Optional[List[str]], model: torch.nn.Module
+) -> List[str]:
+    """Determine which methods to run, given user args and model type."""
+    if args_methods is not None:
+        return args_methods
+
+    # Auto-detect
+    methods = []
+    if is_bcos_model(model):
+        methods.append("bcos")
+    if HAS_GRAD_CAM:
+        methods.extend(["gradcam", "layercam"])
+    methods.append("gradxinput")
+    return methods
+
+
+# ============================================================================
+# Main
+# ============================================================================
+def main():
+    args = parse_args()
+
+    # Device
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    print(f"Device: {device}")
+
+    # Bbox CSV
+    bbox_csv_path = resolve_bbox_csv(args.bbox_csv)
+    print(f"Bbox CSV: {bbox_csv_path}")
+    df_boxes = pd.read_csv(bbox_csv_path)
+    n_with_boxes = len(df_boxes[df_boxes["Target"] == 1]["patientId"].unique())
+    print(f"  {len(df_boxes)} rows, {n_with_boxes} patients with bounding boxes")
+
+    # Output directories:
+    #   - Per-experiment JSONs go into <experiment>/epg_results/
+    #   - Summary CSV/JSON go into a shared directory:
+    #     * --output_dir if specified
+    #     * Otherwise: common parent of all experiments + /epg_results/
+    #       (falls back to first experiment's dir if no common parent found)
+    if args.output_dir:
+        summary_dir = args.output_dir
+    else:
+        # Common parent directory of all experiment paths + /epg_results/
+        abs_paths = [os.path.abspath(p.rstrip("/")) for p in args.experiment_paths]
+        summary_dir = os.path.join(os.path.commonpath(abs_paths), "epg_results")
+    os.makedirs(summary_dir, exist_ok=True)
+    print(f"Summary output dir: {summary_dir}")
+
+    # Run tag for this invocation
+    run_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    all_results = []
+
+    for exp_path in args.experiment_paths:
+        exp_path = exp_path.rstrip("/")
+        if not os.path.isdir(exp_path):
+            print(f"\nWARNING: experiment path does not exist: {exp_path}")
+            continue
+
+        # Per-experiment output directory
+        exp_out_dir = os.path.join(exp_path, "epg_results")
+        os.makedirs(exp_out_dir, exist_ok=True)
+
+        # Peek at the model to determine available methods
+        try:
+            exp = Experiment(exp_path)
+            loaded = exp.load_trained_model(
+                reload=args.reload, return_training_ckpt_if_possible=True
+            )
+            if isinstance(loaded, dict):
+                model = loaded["model"].to(device)
+                training_ckpt = loaded.get("ckpt")
+                peek_epoch = (
+                    training_ckpt["epoch"]
+                    if training_ckpt and "epoch" in training_ckpt
+                    else None
+                )
+            else:
+                model = loaded.to(device)
+                peek_epoch = None
+            del loaded
+            model.eval()
+            print(f"  Loaded checkpoint: reload={args.reload}, epoch={peek_epoch}")
+        except Exception as e:
+            print(f"\nERROR loading {exp_path}: {e}")
+            continue
+
+        methods = resolve_methods(args.methods, model)
+        print(f"\nMethods for {os.path.basename(exp_path)}: {methods}")
+
+        del model  # free memory; evaluate_experiment_method will reload
+        torch.cuda.empty_cache() if device.type == "cuda" else None
+
+        for method in methods:
+            result = evaluate_experiment_method(
+                exp_path=exp_path,
+                method=method,
+                df_boxes=df_boxes,
+                thresholds=args.thresholds,
+                max_samples=args.max_samples,
+                device=device,
+                reload=args.reload,
+                iou_threshold=args.iou_threshold,
+            )
+            all_results.append(result)
+
+            # Save per-method JSON inside the experiment's own directory
+            if not result.get("skipped"):
+                exp_tag = result["experiment_tag"]
+                json_path = os.path.join(
+                    exp_out_dir,
+                    f"epg_{exp_tag}_{method}_{run_tag}.json",
+                )
+                with open(json_path, "w") as f:
+                    json.dump(result, f, indent=2)
+                print(f"  JSON saved: {json_path}")
+
+    # Save combined summary CSV + JSON in the shared summary directory
+    csv_path = os.path.join(summary_dir, f"epg_summary_{run_tag}.csv")
+    write_summary_csv(all_results, csv_path)
+
+    combined_json = os.path.join(summary_dir, f"epg_all_{run_tag}.json")
+    with open(combined_json, "w") as f:
+        json.dump(all_results, f, indent=2)
+    print(f"Combined JSON: {combined_json}")
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()

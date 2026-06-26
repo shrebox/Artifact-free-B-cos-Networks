@@ -1,0 +1,40 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "Faithful, Interpretable Chest X-ray Diagnosis with Artifact-free B-cos Networks"
+authors:
+  - family-names: Arya
+    given-names: Shreyash
+    orcid: "https://orcid.org/0000-0002-2108-4579"
+  - family-names: Agnihotri
+    given-names: Shashank
+    orcid: "https://orcid.org/0000-0001-6097-8551"
+  - family-names: Kleinmann
+    given-names: Marcel
+    orcid: "https://orcid.org/0009-0001-6770-231X"
+  - family-names: Schiele
+    given-names: Bernt
+    orcid: "https://orcid.org/0000-0001-9683-5237"
+  - family-names: Keuper
+    given-names: Margret
+    orcid: "https://orcid.org/0000-0002-8437-7993"
+preferred-citation:
+  type: conference-paper
+  title: "Faithful, Interpretable Chest X-ray Diagnosis with Artifact-free B-cos Networks"
+  authors:
+    - family-names: Arya
+      given-names: Shreyash
+      orcid: "https://orcid.org/0000-0002-2108-4579"
+    - family-names: Agnihotri
+      given-names: Shashank
+      orcid: "https://orcid.org/0000-0001-6097-8551"
+    - family-names: Kleinmann
+      given-names: Marcel
+      orcid: "https://orcid.org/0009-0001-6770-231X"
+    - family-names: Schiele
+      given-names: Bernt
+      orcid: "https://orcid.org/0000-0001-9683-5237"
+    - family-names: Keuper
+      given-names: Margret
+      orcid: "https://orcid.org/0000-0002-8437-7993"
+  collection-title: "Medical Image Computing and Computer-Assisted Intervention (MICCAI)"
+  year: 2026
