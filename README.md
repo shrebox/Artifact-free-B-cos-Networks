@@ -21,8 +21,10 @@
 
   <h3>
     <a href="https://papers.miccai.org/miccai-2026/paper/3915_paper.pdf">Paper</a> |
+    <a href="https://arxiv.org/abs/2507.16761">arXiv (extended)</a> |
     <a href="https://papers.miccai.org/miccai-2026/0372-Paper3915.html">Proceedings Page</a> |
-    <a href="https://github.com/shrebox/Artifact-free-B-cos-Networks/">Code</a>
+    <a href="https://github.com/shrebox/Artifact-free-B-cos-Networks/">Code</a> |
+    <a href="https://shrebox.github.io/files/miccai2026_poster.pdf">Poster</a>
   </h3>
   
 </div>
