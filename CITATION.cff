@@ -1,5 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite the paper below."
+repository-code: "https://github.com/shrebox/Artifact-free-B-cos-Networks"
+url: "https://papers.miccai.org/miccai-2026/0372-Paper3915.html"
 title: "Faithful, Interpretable Chest X-ray Diagnosis with Artifact-free B-cos Networks"
 authors:
   - family-names: Arya
@@ -36,5 +38,17 @@ preferred-citation:
     - family-names: Keuper
       given-names: Margret
       orcid: "https://orcid.org/0000-0002-8437-7993"
-  collection-title: "Medical Image Computing and Computer-Assisted Intervention (MICCAI)"
+  collection-title: "Medical Image Computing and Computer Assisted Intervention -- MICCAI 2026"
+  collection-type: proceedings
+  publisher:
+    name: "Springer Nature Switzerland"
+  volume-title: "LNCS 16882"
+  conference:
+    name: "29th International Conference on Medical Image Computing and Computer Assisted Intervention (MICCAI 2026)"
+    city: "Strasbourg"
+    country: "FR"
+    date-start: 2026-09-27
+    date-end: 2026-10-01
+  month: 9
   year: 2026
+  url: "https://papers.miccai.org/miccai-2026/0372-Paper3915.html"

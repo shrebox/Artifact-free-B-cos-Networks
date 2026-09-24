@@ -20,7 +20,8 @@
   </h3>
 
   <h3>
-    <a href="#">Paper</a> |
+    <a href="https://papers.miccai.org/miccai-2026/paper/3915_paper.pdf">Paper</a> |
+    <a href="https://papers.miccai.org/miccai-2026/0372-Paper3915.html">Proceedings Page</a> |
     <a href="https://github.com/shrebox/Artifact-free-B-cos-Networks/">Code</a>
   </h3>
   
@@ -129,13 +130,18 @@ The models are built on top of B-cos-v2 backbones pre-trained on ImageNet (and a
 
 ## Citation
 
-Please cite as follows (the official proceedings reference — LNCS volume, pages, DOI — will be added once the MICCAI 2026 proceedings are published):
+Please cite as follows (official MICCAI 2026 reference; the page numbers and DOI will be filled in once the proceedings appear on SpringerLink):
 
 ```tex
-@inproceedings{arya2026artifactfree,
+@InProceedings{AryShr_Faithful_MICCAI2026,
  author = {Arya, Shreyash and Agnihotri, Shashank and Kleinmann, Marcel and Schiele, Bernt and Keuper, Margret},
- booktitle = {Medical Image Computing and Computer-Assisted Intervention (MICCAI)},
- title = {Faithful, Interpretable Chest X-ray Diagnosis with Artifact-free B-cos Networks},
- year = {2026}
+ title = {Faithful, Interpretable Chest X-ray Diagnosis with Artifact-Free B-cos Networks},
+ booktitle = {Medical Image Computing and Computer Assisted Intervention -- MICCAI 2026},
+ year = {2026},
+ publisher = {Springer Nature Switzerland},
+ volume = {LNCS 16882},
+ month = {September},
+ pages = {pending},
+ url = {https://papers.miccai.org/miccai-2026/0372-Paper3915.html}
 }
 ```
